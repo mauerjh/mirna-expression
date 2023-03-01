@@ -1,0 +1,2102 @@
+---
+title: "Quality Control of miRNA sequencing (Code/Complete Version)"
+author: "Jessica"
+date: "10/09/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+We will need two files: 1) sample information table (`coldata`), and 2) count matrix data (`unicount`) And format them so data is in the same order.
+
+```{r message=FALSE, warning=FALSE}
+library("DESeq2")
+library ("ggplot2")
+library("ggfortify")
+library("ggrepel")
+library("dplyr")
+
+# Ler count data
+setwd("~/Documents/Jessica/analise-seq/")
+unicount <- read.csv("4b_ReadCountUniquely.txt", row.names=1, sep="")
+colnames(unicount) <- gsub("uni", "", colnames(unicount))
+colnames(unicount) <- gsub("X", "", colnames(unicount))
+colnames(unicount) <- gsub("\\.", "-", colnames(unicount))
+
+# ler col data (metadados)
+coldata <- read.table("metadata-selection.tsv", h=T, sep="\t")
+coldata$age <- gsub(",",".", coldata$age)
+coldata$bage <- gsub(",",".", coldata$bage)
+coldata$id_amostra <- gsub("_","-", coldata$id_amostra)
+isol_batch <- read.csv2("isolation-batch.csv", h=T)[1:240,1:2]
+seq_batch <- read.csv2("sequencing-batch.csv", h=T)[1:240,1:2]
+seq_batch$id_amostra <- gsub("_S..", "", seq_batch$id_amostra)
+seq_batch$id_amostra <- gsub("_S.", "", seq_batch$id_amostra)
+
+#juntar seq batch e isol batch
+coldata <- inner_join(coldata, isol_batch, by='id_amostra')
+coldata <- inner_join(coldata, seq_batch, by='id_amostra')
+rm(isol_batch)
+rm(seq_batch)
+coldata <- coldata[,c(2,1,3:18)]
+
+# ordenar tabela de metadado pela ordem do count data
+coldata <- coldata[order(match(coldata[,1],colnames(unicount))),]
+
+# salvar tabela de metadados
+write.csv2(coldata, "metadata_allsamples.csv", col.names = T)
+coldata <- read.csv2("metadata_allsamples.csv", h=T)
+#colocando id como nome da linha no metadado
+rownames(coldata) <- coldata$id_amostra
+coldata <- coldata[,c(-1,-2)]
+
+# checar se estão batendo
+all(rownames(coldata) %in% colnames(unicount))
+all(rownames(coldata) == colnames(unicount))
+
+```
+
+```{r message=FALSE, warning=FALSE}
+
+# Retirada da amostras que falharam sequenciamento (10928-w1, 10928-w2) da unicount e coldata
+unicount <- unicount[,c(-223,-224)]
+coldata <- coldata[c(-223,-224),]
+all(rownames(coldata) == colnames(unicount))
+
+```
+
+First, we can look at total read counts per sample
+```{r include = TRUE, message=FALSE, warning=FALSE}
+barplot(colSums(unicount), las=3,main="Total uniquely mapped miRNA read counts per sample", ylab="Total miRNA read counts", border = NA)
+
+```
+
+Then, we can look to mean read counts per gene. First we can filter only genes with higher expression (the first 30)
+```{r include = TRUE, message=FALSE, warning=FALSE}
+cts_order <- unicount[order(rowMeans(unicount), decreasing = T),]
+cts_order_f <- cts_order[1:30,]
+rownames(cts_order_f) <- gsub("[:MIMAT].*", "", rownames(cts_order_f))
+rownames(cts_order_f) <- gsub("hsa-", "", rownames(cts_order_f))
+barplot(rowMeans(cts_order_f[,]), las=2,main="Média de contagens por transcrito", ylab="Média de contagens de leituras",cex.axis = 0.75,cex.names=0.75)
+
+```
+
+Then, we can check if our data should be modeled using the Poisson distribution or Negative Binomial distribution. It can be helpful to plot the mean versus the variance of your data. Remember for the Poisson model, mean = variance, but for NB, mean < variance.
+
+```{r include = TRUE, message=FALSE, warning=FALSE}
+mean_counts <- apply(unicount, 1, mean)
+variance_counts <- apply(unicount, 1, var)
+df_cases <- data.frame(mean_counts, variance_counts)
+
+ggplot(df_cases) +
+        geom_point(aes(x=mean_counts, y=variance_counts)) + 
+        geom_line(aes(x=mean_counts, y=mean_counts, color="red")) +
+        scale_y_log10() +
+        scale_x_log10()
+
+```
+Our data seems to fit a Negative Binomial distribution the most (because mean < variance). 
+
+
+### MODELO BANCO LONG
+
+# TRAJETÓRIAS
+```{r}
+# tirar controles que tinham tratamento 10808 10819 10712
+
+unicount <- unicount[,c(-87,-88, -89, -90,-219, -220)]
+coldata <- coldata[c(-87,-88, -89, -90, -219, -220),]
+all(rownames(coldata) == colnames(unicount))
+
+```
+
+
+```{r}
+str(coldata)
+n.control <- nrow(filter(coldata,Trajetoria == "A"))/2
+n.incident <-  nrow(filter(coldata,Trajetoria == "B"))/2
+n.remitted <-  nrow(filter(coldata,Trajetoria == "C"))/2
+n.persistent <-  nrow(filter(coldata,Trajetoria == "D"))/2
+n.control + n.incident + n.persistent + n.remitted
+head(coldata)
+
+#Sort by group than subjectID
+coldata_filter <- coldata[
+  with(coldata, order(Trajetoria, subjectid)),
+]
+
+#Then add a column ind.n which distinguishes the individuals nested within a group
+coldata_filter$ind.n <- factor(c(rep(1:n.control, each = 2), rep(1:n.incident, each = 2), rep(1:n.remitted, each = 2), rep(1:n.persistent, each = 2)))
+
+#Order coldata and cts dataset
+coldata_filter <- coldata_filter[order(row.names(coldata_filter)),]
+unicount_filter <- unicount[,order(colnames(unicount))]
+all(rownames(coldata_filter) == colnames(unicount_filter))
+
+m1 <- model.matrix(~ Trajetoria + Trajetoria:ind.n + Trajetoria:wave, coldata_filter)
+all.zero <- apply(m1, 2, function(x) all(x==0))
+all.zero
+idx <- which(all.zero)
+m1 <- m1[,-idx]
+dds_groups <- DESeqDataSetFromMatrix(countData = unicount_filter,
+                              colData = coldata_filter,
+                              design = m1)
+
+keep_counts <- rowSums(counts(dds_groups) >= 3) >= 162
+dds_groups <- dds_groups[keep_counts,]
+
+dds_groups <- DESeq(dds_groups)
+
+res <- results(dds_groups)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered
+
+
+resultsNames(dds_groups)
+
+#Look differences between control and incident groups = INTERACAO
+Inc.vs.Control<-results(dds_groups, contrast=list("TrajetoriaB.wavew2","TrajetoriaA.wavew2"))
+summary(Inc.vs.Control)
+Inc.vs.ControlOrdered <- Inc.vs.Control[order(Inc.vs.Control$pvalue),]
+
+#Look differences between control and incident groups
+Inc.vs.Control<-results(dds_groups, contrast=list("TrajetoriaB"))
+summary(Inc.vs.Control)
+Inc.vs.ControlOrdered <- Inc.vs.Control[order(Inc.vs.Control$pvalue),]
+
+#Look differences between remitted and persistent groups - INTERACAO
+Rem.vs.Pers<-results(dds_groups, contrast=list("TrajetoriaC.wavew2","TrajetoriaD.wavew2"))
+summary(Rem.vs.Pers)
+Rem.vs.PersOrdered <- Rem.vs.Pers[order(Rem.vs.Pers$pvalue),]
+
+
+#Look differences between remitted and persistent groups
+Rem.vs.Pers<-results(dds_groups, contrast=list("TrajetoriaC","TrajetoriaD"))
+summary(Rem.vs.Pers)
+Rem.vs.PersOrdered <- Rem.vs.Pers[order(Rem.vs.Pers$pvalue),]
+
+## testar trocando a ordem das linhas
+
+```
+
+
+#DIAGNOSTICO
+```{r}
+str(coldata)
+n.control <- nrow(filter(coldata,dcmadep== 0))/2
+n.case <-  nrow(filter(coldata,dcmadep == 2))/2
+head(coldata)
+
+#Sort by group than subjectID
+coldata_filter <- coldata[
+  with(coldata, order(dcmadep, subjectid)),
+]
+
+#Then add a column ind.n which distinguishes the individuals nested within a group
+coldata_filter$ind.n <- factor(c(rep(1:61, each = 2), rep(1:171, each = 2)))
+
+#Order coldata and cts dataset
+coldata_filter <- coldata_filter[order(row.names(coldata_filter)),]
+unicount_filter <- unicount[,order(colnames(unicount))]
+all(rownames(coldata_filter) == colnames(unicount_filter))
+
+
+coldata_filter$subjectid <- as.factor(coldata_filter$subjectid)
+
+m2 <- model.matrix(~ dcmadep + wave + dcmadep:wave, coldata_filter)
+all.zero <- apply(m2, 2, function(x) all(x==0))
+all.zero
+idx <- which(all.zero)
+m2 <- m2[,-idx]
+
+dds_groups <- DESeqDataSetFromMatrix(countData = unicount_filter,
+                              colData = coldata_filter,
+                              design = ~ subjectid + wave + dcmadep)
+
+keep_counts <- rowSums(counts(dds_groups) >= 3) >= 162
+dds_groups <- dds_groups[keep_counts,]
+
+dds_groups <- DESeq(dds_groups)
+
+res <- results(dds_groups)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered
+
+
+resultsNames(dds_groups)
+
+res <- results(dds_groups, contrast=list("dcmadep2.wavew1"))
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered
+
+#Look differences between control and incident groups = INTERACAO
+Inc.vs.Control<-results(dds_groups, contrast=list("TrajetoriaB.wavew2","TrajetoriaA.wavew2"))
+summary(Inc.vs.Control)
+Inc.vs.ControlOrdered <- Inc.vs.Control[order(Inc.vs.Control$pvalue),]
+
+#Look differences between control and incident groups
+Inc.vs.Control<-results(dds_groups, contrast=list("TrajetoriaB"))
+summary(Inc.vs.Control)
+Inc.vs.ControlOrdered <- Inc.vs.Control[order(Inc.vs.Control$pvalue),]
+
+#Look differences between remitted and persistent groups - INTERACAO
+Rem.vs.Pers<-results(dds_groups, contrast=list("TrajetoriaC.wavew2","TrajetoriaD.wavew2"))
+summary(Rem.vs.Pers)
+Rem.vs.PersOrdered <- Rem.vs.Pers[order(Rem.vs.Pers$pvalue),]
+
+
+#Look differences between remitted and persistent groups
+Rem.vs.Pers<-results(dds_groups, contrast=list("TrajetoriaC","TrajetoriaD"))
+summary(Rem.vs.Pers)
+Rem.vs.PersOrdered <- Rem.vs.Pers[order(Rem.vs.Pers$pvalue),]
+
+```
+
+
+
+
+
+
+
+
+#DESENHOS TRANSVERSAIS
+### w1
+```{r}
+#selecting only w1
+coldata_w1 <- coldata[coldata$wave=="w1",]
+unicount_w1 <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1)==rownames(coldata_w1))
+
+```
+```{r}
+# arrumar os tipos de vars
+# assure coldata vars are correct type #tem que vie depois da subdividao
+coldata_w1$sex <- factor(coldata_w1$sex)
+coldata_w1$age <- as.numeric(coldata_w1$age)
+coldata_w1$Trajetoria <- factor(coldata_w1$Trajetoria)
+coldata_w1$isol_batch <- factor(coldata_w1$isol_batch)
+coldata_w1$batch <- factor(coldata_w1$batch) #seq batch
+coldata_w1$subjectid <- factor(coldata_w1$subjectid)
+coldata_w1$dcmadep <- factor(coldata_w1$dcmadep)
+```
+
+Análise diferencial
+```{r}
+coldata_w1$scaled_age <- scale(coldata_w1$age)
+
+# Sexo na w1
+dds_uni_w1_sex <- DESeqDataSetFromMatrix(countData = unicount_w1,
+                                  colData = coldata_w1,
+                                  design = ~ sex)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w1_sex) >= 3) >= 5
+dds_uni_w1_sex <- dds_uni_w1_sex[keep_counts,]
+
+# lists the coefficients
+dds_uni_w1_sex <- DESeq(dds_uni_w1_sex)
+res <- results(dds_uni_w1_sex)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:20),], "", col.names=T, row.names=T, quote=F)
+
+
+# MDD na w1
+dds_uni_w1_mdd <- DESeqDataSetFromMatrix(countData = unicount_w1,
+                                  colData = coldata_w1,
+                                  design = ~ dcmadep)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w1_mdd) >= 3) >= 5
+dds_uni_w1_mdd <- dds_uni_w1_mdd[keep_counts,]
+
+#Definir "w1" como ref para comparacao
+dds_uni_w1_mdd$dcmadep <- relevel(dds_uni_w1_mdd$dcmadep, ref = "0")
+
+# lists the coefficients
+dds_uni_w1_mdd <- DESeq(dds_uni_w1_mdd)
+res <- results(dds_uni_w1_mdd)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:20),], "", col.names=T, row.names=T, quote=F)
+
+
+
+```
+
+# w2
+```{r}
+#selecting only w2
+coldata_w2 <- coldata[coldata$wave=="w2",]
+unicount_w2 <- unicount[, which(colnames(unicount)%in%rownames(coldata_w2))]
+
+#check if worked = TRUE
+all(colnames(unicount_w2)==rownames(coldata_w2))
+
+```
+```{r}
+# arrumar os tipos de vars
+# assure coldata vars are correct type #tem que vie depois da subdividao
+coldata_w2$sex <- factor(coldata_w2$sex)
+coldata_w2$age <- as.numeric(coldata_w2$age)
+coldata_w2$Trajetoria <- factor(coldata_w2$Trajetoria)
+coldata_w2$isol_batch <- factor(coldata_w2$isol_batch)
+coldata_w2$batch <- factor(coldata_w2$batch) #seq batch
+coldata_w2$subjectid <- factor(coldata_w2$subjectid)
+coldata_w2$dcmadep <- factor(coldata_w2$dcmadep)
+
+```
+
+Análise diferencial
+```{r}
+coldata_w2$scaled_age <- scale(coldata_w2$age)
+
+# Sexo na w2
+dds_uni_w2_sex <- DESeqDataSetFromMatrix(countData = unicount_w2,
+                                  colData = coldata_w2,
+                                  design = ~ scaled_age + sex)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w2_sex) >= 3) >= 5
+dds_uni_w2_sex <- dds_uni_w2_sex[keep_counts,]
+
+# lists the coefficients
+dds_uni_w2_sex <- DESeq(dds_uni_w2_sex)
+res <- results(dds_uni_w2_sex)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:20),], "", col.names=T, row.names=T, quote=F)
+
+
+# MDD na w2
+
+dds_uni_w2_mdd <- DESeqDataSetFromMatrix(countData = unicount_w2,
+                                  colData = coldata_w2,
+                                  design = ~ scaled_age + sex + dcmadep)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w2_mdd) >= 3) >= 89
+dds_uni_w2_mdd <- dds_uni_w2_mdd[keep_counts,]
+
+#Definir "w2" como ref para comparacao
+dds_uni_w2_mdd$dcmadep <- relevel(dds_uni_w2_mdd$dcmadep, ref = "0")
+
+# lists the coefficients
+dds_uni_w2_mdd <- DESeq(dds_uni_w2_mdd)
+res <- results(dds_uni_w2_mdd)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:20),], "mdd_w2_covsexage_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+
+```
+
+## MDD W1
+```{r}
+# mdd CONTROLES LIMPOS w1:
+# 30 controles e 23 casos
+# Limpo só na w1
+coldata_w1$dcmdd_limpo <- ifelse(coldata_w1$Trajetoria == "A", 0,1)
+coldata_w1$dcmdd_limpo[which(coldata_w1$dcmadep == 2)] = 2
+
+coldata_w1_mddlimpo <- coldata_w1[which(coldata_w1$dcmdd_limpo == 0 | coldata_w1$dcmdd_limpo == 2),]
+
+coldata_w1_mddlimpo$dcmdd_limpo <- factor(coldata_w1_mddlimpo$dcmdd_limpo)
+
+#unicount
+unicount_w1_mddlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1_mddlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1_mddlimpo)==rownames(coldata_w1_mddlimpo))
+
+#30 controls and 11 cases
+dds_uni_w1_mddlimpo <- DESeqDataSetFromMatrix(countData = unicount_w1_mddlimpo,
+                                  colData = coldata_w1_mddlimpo,
+                                  design = ~ scaled_age + sex + dcmdd_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w1_mddlimpo) >= 3) >= 39
+dds_uni_w1_mddlimpo <- dds_uni_w1_mddlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w1_mddlimpo$dcmdd_limpo <- relevel(dds_uni_w1_mddlimpo$dcmdd_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w1_mddlimpo <- DESeq(dds_uni_w1_mddlimpo)
+res <- results(dds_uni_w1_mddlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "mdd_controlesLIMPOS_w1_covsexage_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+```{r}
+# MDD CONTROLES sujos w1:
+# Limpo só na w1
+coldata_w1$dcmdd_limpo <- ifelse(coldata_w1$dcmadep == 0 & coldata_w1$dcany == 0, 0, 2)
+coldata_w1$dcmdd_limpo[which(coldata_w1$dcmadep == 0 & coldata_w1$dcany == 2)] = 1
+
+coldata_w1_mddlimpo <- coldata_w1[which(coldata_w1$dcmdd_limpo == 0 | coldata_w1$dcmdd_limpo == 2),]
+table(coldata_w1_mddlimpo$dcmdd_limpo)
+coldata_w1_mddlimpo$dcmdd_limpo <- factor(coldata_w1_mddlimpo$dcmdd_limpo)
+#unicount
+unicount_w1_mddlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1_mddlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1_mddlimpo)==rownames(coldata_w1_mddlimpo))
+
+#56 controls and 38 cases
+dds_uni_w1_mddlimpo <- DESeqDataSetFromMatrix(countData = unicount_w1_mddlimpo,
+                                  colData = coldata_w1_mddlimpo,
+                                  design = ~ scaled_age + sex + dcmdd_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w1_mddlimpo) >= 3) >= 57
+dds_uni_w1_mddlimpo <- dds_uni_w1_mddlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w1_mddlimpo$dcmdd_limpo <- relevel(dds_uni_w1_mddlimpo$dcmdd_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w1_mddlimpo <- DESeq(dds_uni_w1_mddlimpo)
+res <- results(dds_uni_w1_mddlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "mdd_controles_sujos_w1_covsexage_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+
+
+## MDD W2
+
+```{r}
+# mdd CONTROLES LIMPOS W2:
+# 30 controles e 38 casos
+# Limpo só na W2
+coldata_w2$dcmdd_limpo <- ifelse(coldata_w2$Trajetoria == "A", 0,1)
+coldata_w2$dcmdd_limpo[which(coldata_w2$dcmadep == 2)] = 2
+
+coldata_w2_mddlimpo <- coldata_w2[which(coldata_w2$dcmdd_limpo == 0 | coldata_w2$dcmdd_limpo == 2),]
+
+coldata_w2_mddlimpo$dcmdd_limpo <- factor(coldata_w2_mddlimpo$dcmdd_limpo)
+
+#unicount
+unicount_w2_mddlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w2_mddlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w2_mddlimpo)==rownames(coldata_w2_mddlimpo))
+
+#30 controls and 11 cases
+dds_uni_w2_mddlimpo <- DESeqDataSetFromMatrix(countData = unicount_w2_mddlimpo,
+                                  colData = coldata_w2_mddlimpo,
+                                  design = ~ scaled_age + sex + dcmdd_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w2_mddlimpo) >= 3) >= 51
+dds_uni_w2_mddlimpo <- dds_uni_w2_mddlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w2_mddlimpo$dcmdd_limpo <- relevel(dds_uni_w2_mddlimpo$dcmdd_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w2_mddlimpo <- DESeq(dds_uni_w2_mddlimpo)
+res <- results(dds_uni_w2_mddlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "mdd_controlesLIMPOS_w2_covsexage_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+
+```
+
+
+```{r}
+# MDD CONTROLES sujos W2:
+# Limpo só na W2
+coldata_w2$dcmdd_limpo <- ifelse(coldata_w2$dcmadep == 0 & coldata_w2$dcany == 0, 0, 2)
+coldata_w2$dcmdd_limpo[which(coldata_w2$dcmadep == 0 & coldata_w2$dcany == 2)] = 1
+
+coldata_w2_mddlimpo <- coldata_w2[which(coldata_w2$dcmdd_limpo == 0 | coldata_w2$dcmdd_limpo == 2),]
+table(coldata_w2_mddlimpo$dcmdd_limpo)
+coldata_w2_mddlimpo$dcmdd_limpo <- factor(coldata_w2_mddlimpo$dcmdd_limpo)
+#unicount
+unicount_w2_mddlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w2_mddlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w2_mddlimpo)==rownames(coldata_w2_mddlimpo))
+
+#56 controls and 38 cases
+dds_uni_w2_mddlimpo <- DESeqDataSetFromMatrix(countData = unicount_w2_mddlimpo,
+                                  colData = coldata_w2_mddlimpo,
+                                  design = ~ scaled_age + sex + dcmdd_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w2_mddlimpo) >= 3) >= 70
+dds_uni_w2_mddlimpo <- dds_uni_w2_mddlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w2_mddlimpo$dcmdd_limpo <- relevel(dds_uni_w2_mddlimpo$dcmdd_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w2_mddlimpo <- DESeq(dds_uni_w2_mddlimpo)
+res <- results(dds_uni_w2_mddlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "mdd_controles_sujos_w2_covAGE_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+# Limpo ever disorder
+```
+
+## ADHD W1 ****
+```{r}
+# ADHD CONTROLES LIMPOS w1:
+# 30 controles e 15 casos (persistentes + remitentes)
+# Limpo só na W2
+coldata_w1$dcadhd_limpo <- ifelse(coldata_w1$Trajetoria == "A", 0,1)
+coldata_w1$dcadhd_limpo[which(coldata_w1$dcanyhk == 2)] = 2
+
+coldata_w1_adhdlimpo <- coldata_w1[which(coldata_w1$dcadhd_limpo == 0 | coldata_w1$dcadhd_limpo == 2),]
+
+coldata_w1_adhdlimpo$dcadhd_limpo <- factor(coldata_w1_adhdlimpo$dcadhd_limpo)
+
+#unicount
+unicount_w1_adhdlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1_adhdlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1_adhdlimpo)==rownames(coldata_w1_adhdlimpo))
+
+#30 controls and 15 cases
+dds_uni_w1_adhdlimpo <- DESeqDataSetFromMatrix(countData = unicount_w1_adhdlimpo,
+                                  colData = coldata_w1_adhdlimpo,
+                                  design = ~ scaled_age + sex + dcadhd_limpo)
+
+### Filtrando 75%
+keep_counts <- rowSums(counts(dds_uni_w1_adhdlimpo) >= 3) >= 33
+dds_uni_w1_adhdlimpo <- dds_uni_w1_adhdlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w1_adhdlimpo$dcadhd_limpo <- relevel(dds_uni_w1_adhdlimpo$dcadhd_limpo, ref = "0")
+
+# lists the coefficients 75% 185 mirs = um upregulated hsa-miR-328-3p
+dds_uni_w1_adhdlimpo <- DESeq(dds_uni_w1_adhdlimpo)
+res <- results(dds_uni_w1_adhdlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "adhd_controlesLIMPOS_w1_covAGEsex_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+
+```{r}
+# ADHD Controles transversal W1
+# 54 controles e 15 casos
+# Limpo só na W2
+coldata_w1$dcadhd_limpo <- ifelse(coldata_w1$dcanyhk == 0 & coldata_w1$dcany == 0, 0, 2)
+coldata_w1$dcadhd_limpo[which(coldata_w1$dcanyhk == 0 & coldata_w1$dcany == 2)] = 1
+
+coldata_w1_adhdlimpo <- coldata_w1[which(coldata_w1$dcadhd_limpo == 0 | coldata_w1$dcadhd_limpo == 2),]
+
+coldata_w1_adhdlimpo$dcadhd_limpo <- factor(coldata_w1_adhdlimpo$dcadhd_limpo)
+
+#unicount
+unicount_w1_adhdlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1_adhdlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1_adhdlimpo)==rownames(coldata_w1_adhdlimpo))
+
+#30 controls and 11 cases
+dds_uni_w1_adhdlimpo <- DESeqDataSetFromMatrix(countData = unicount_w1_adhdlimpo,
+                                  colData = coldata_w1_adhdlimpo,
+                                  design = ~ scaled_age + sex + dcadhd_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w1_adhdlimpo) >= 3) >= 51
+dds_uni_w1_adhdlimpo <- dds_uni_w1_adhdlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w1_adhdlimpo$dcadhd_limpo <- relevel(dds_uni_w1_adhdlimpo$dcadhd_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w1_adhdlimpo <- DESeq(dds_uni_w1_adhdlimpo)
+res <- results(dds_uni_w1_adhdlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "adhd_controlessujos_w1_covsexage_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+## ADHD W1 separado por sexo
+
+```{r}
+# ADHD CONTROLES LIMPOS w1
+# Masculino: 17 controles e 11 casos (persistentes + remitentes)
+# Feminino: 13 controles e 4 casos
+# Limpo só na W2
+coldata_w1$dcadhd_limpo <- ifelse(coldata_w1$Trajetoria == "A" & coldata_w1$sex == 1, 0,1)
+coldata_w1$dcadhd_limpo[which(coldata_w1$dcanyhk == 2 & coldata_w1$sex == 1)] = 2
+
+coldata_w1_adhdlimpo <- coldata_w1[which(coldata_w1$dcadhd_limpo == 0 | coldata_w1$dcadhd_limpo == 2),]
+
+coldata_w1_adhdlimpo$dcadhd_limpo <- factor(coldata_w1_adhdlimpo$dcadhd_limpo)
+
+table(coldata_w1_adhdlimpo$dcadhd_limpo)
+#unicount
+unicount_w1_adhdlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1_adhdlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1_adhdlimpo)==rownames(coldata_w1_adhdlimpo))
+
+#30 controls and 15 cases
+dds_uni_w1_adhdlimpo <- DESeqDataSetFromMatrix(countData = unicount_w1_adhdlimpo,
+                                  colData = coldata_w1_adhdlimpo,
+                                  design = ~ scaled_age + dcadhd_limpo)
+
+### Filtrando 75%
+keep_counts <- rowSums(counts(dds_uni_w1_adhdlimpo) >= 3) >= 21
+dds_uni_w1_adhdlimpo <- dds_uni_w1_adhdlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w1_adhdlimpo$dcadhd_limpo <- relevel(dds_uni_w1_adhdlimpo$dcadhd_limpo, ref = "0")
+
+# lists the coefficients 75% 185 mirs = um upregulated hsa-miR-328-3p
+dds_uni_w1_adhdlimpo <- DESeq(dds_uni_w1_adhdlimpo)
+res <- results(dds_uni_w1_adhdlimpo)
+summary(res)
+
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "adhd_controlesLIMPOS_w1_covAGEsex_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+
+## ADHD W2
+```{r}
+# ADHD CONTROLES LIMPOS W2:
+# 30 controles e 11 casos
+# Limpo só na W2
+coldata_w2$dcadhd_limpo <- ifelse(coldata_w2$Trajetoria == "A", 0,1)
+coldata_w2$dcadhd_limpo[which(coldata_w2$dcanyhk == 2)] = 2
+
+coldata_w2_adhdlimpo <- coldata_w2[which(coldata_w2$dcadhd_limpo == 0 | coldata_w2$dcadhd_limpo == 2),]
+
+coldata_w2_adhdlimpo$dcadhd_limpo <- factor(coldata_w2_adhdlimpo$dcadhd_limpo)
+
+#unicount
+unicount_w2_adhdlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w2_adhdlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w2_adhdlimpo)==rownames(coldata_w2_adhdlimpo))
+
+#30 controls and 11 cases
+dds_uni_w2_adhdlimpo <- DESeqDataSetFromMatrix(countData = unicount_w2_adhdlimpo,
+                                  colData = coldata_w2_adhdlimpo,
+                                  design = ~ scaled_age + sex + dcadhd_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w2_adhdlimpo) >= 3) >= 30
+dds_uni_w2_adhdlimpo <- dds_uni_w2_adhdlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w2_adhdlimpo$dcadhd_limpo <- relevel(dds_uni_w2_adhdlimpo$dcadhd_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w2_adhdlimpo <- DESeq(dds_uni_w2_adhdlimpo)
+res <- results(dds_uni_w2_adhdlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "mdd_controlesLIMPOS_w2_covAGE_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+```{r}
+# ADHD Controles transversal W2
+# 56 controles e 11 casos
+# Limpo só na W2
+coldata_w2$dcadhd_limpo <- ifelse(coldata_w2$dcanyhk == 0 & coldata_w2$dcany == 0, 0, 2)
+coldata_w2$dcadhd_limpo[which(coldata_w2$dcanyhk == 0 & coldata_w2$dcany == 2)] = 1
+
+coldata_w2_adhdlimpo <- coldata_w2[which(coldata_w2$dcadhd_limpo == 0 | coldata_w2$dcadhd_limpo == 2),]
+
+coldata_w2_adhdlimpo$dcadhd_limpo <- factor(coldata_w2_adhdlimpo$dcadhd_limpo)
+
+#unicount
+unicount_w2_adhdlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w2_adhdlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w2_adhdlimpo)==rownames(coldata_w2_adhdlimpo))
+
+#30 controls and 11 cases
+dds_uni_w2_adhdlimpo <- DESeqDataSetFromMatrix(countData = unicount_w2_adhdlimpo,
+                                  colData = coldata_w2_adhdlimpo,
+                                  design = ~ scaled_age + sex + dcadhd_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w2_adhdlimpo) >= 3) >= 50
+dds_uni_w2_adhdlimpo <- dds_uni_w2_adhdlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w2_adhdlimpo$dcadhd_limpo <- relevel(dds_uni_w2_adhdlimpo$dcadhd_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w2_adhdlimpo <- DESeq(dds_uni_w2_adhdlimpo)
+res <- results(dds_uni_w2_adhdlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "mdd_controlesLIMPOS_w2_covAGE_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+
+## ANX W1 ****
+##### Quando any anx, hsa-miR-338-3p é sig down reg. Quando generalized anx (9 casos), nada sig
+#### nos controles "sujos, sig some
+### resultado só aparece com scaled_age + anx e scaled age + sex + anx. 
+```{r}
+# anx CONTROLES LIMPOS W2:
+# 30 controles e 15 casos (persistentes + remitentes)
+# Limpo só na W2
+coldata_w1$dcanx_limpo <- ifelse(coldata_w1$Trajetoria == "A", 0,1)
+coldata_w1$dcanx_limpo[which(coldata_w1$dcgena == 2 | coldata_w1$dcanyanx == 2)] = 2
+
+coldata_w1_anxlimpo <- coldata_w1[which(coldata_w1$dcanx_limpo == 0 | coldata_w1$dcanx_limpo == 2),]
+
+coldata_w1_anxlimpo$dcanx_limpo <- factor(coldata_w1_anxlimpo$dcanx_limpo)
+
+#unicount
+unicount_w1_anxlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1_anxlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1_anxlimpo)==rownames(coldata_w1_anxlimpo))
+
+#30 controls and 23 cases (any anx), 30 controls and 9 cases (gen anx) 
+dds_uni_w1_anxlimpo <- DESeqDataSetFromMatrix(countData = unicount_w1_anxlimpo,
+                                  colData = coldata_w1_anxlimpo,
+                                  design = ~ scaled_age + sex + dcanx_limpo)
+
+### Filtrando 75%
+keep_counts <- rowSums(counts(dds_uni_w1_anxlimpo) >= 3) >= 33
+dds_uni_w1_anxlimpo <- dds_uni_w1_anxlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w1_anxlimpo$dcanx_limpo <- relevel(dds_uni_w1_anxlimpo$dcanx_limpo, ref = "0")
+
+# lists the coefficients 75% 185 mirs = um upregulated hsa-miR-328-3p
+dds_uni_w1_anxlimpo <- DESeq(dds_uni_w1_anxlimpo)
+res <- results(dds_uni_w1_anxlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "anx_controlesLIMPOS_w1_covAGEsex_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+
+```{r}
+# anx Controles transversal W1
+# 54 controles e 23 casos
+# Limpo só na W1
+coldata_w1$dcanx_limpo <- ifelse(coldata_w1$dcanyanx == 0 & coldata_w1$dcany == 0, 0, 2)
+coldata_w1$dcanx_limpo[which(coldata_w1$dcanyanx == 0 & coldata_w1$dcany == 2)] = 1
+
+coldata_w1_anxlimpo <- coldata_w1[which(coldata_w1$dcanx_limpo == 0 | coldata_w1$dcanx_limpo == 2),]
+
+coldata_w1_anxlimpo$dcanx_limpo <- factor(coldata_w1_anxlimpo$dcanx_limpo)
+
+#unicount
+unicount_w1_anxlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1_anxlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1_anxlimpo)==rownames(coldata_w1_anxlimpo))
+
+#30 controls and 11 cases
+dds_uni_w1_anxlimpo <- DESeqDataSetFromMatrix(countData = unicount_w1_anxlimpo,
+                                  colData = coldata_w1_anxlimpo,
+                                  design = ~ scaled_age + sex + dcanx_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w1_anxlimpo) >= 3) >= 39
+dds_uni_w1_anxlimpo <- dds_uni_w1_anxlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w1_anxlimpo$dcanx_limpo <- relevel(dds_uni_w1_anxlimpo$dcanx_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w1_anxlimpo <- DESeq(dds_uni_w1_anxlimpo)
+res <- results(dds_uni_w1_anxlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "mdd_controlesLIMPOS_w1_covAGE_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+
+## ANX W2 ***
+### Resultado só na comparacao de controles "sujos" = 4 down 
+# hsa-miR-432-5p hsa-miR-151a-5p hsa-miR-584-5p hsa-let-7c-5p
+```{r}
+# anx CONTROLES LIMPOS W2:
+# 30 controles e 26 casos (persistentes + incidentes)
+# Limpo só na W2
+coldata_w2$dcanx_limpo <- ifelse(coldata_w2$Trajetoria == "A", 0,1)
+coldata_w2$dcanx_limpo[which(coldata_w2$dcgena == 2 | coldata_w2$dcanyanx == 2)] = 2
+
+coldata_w2_anxlimpo <- coldata_w2[which(coldata_w2$dcanx_limpo == 0 | coldata_w2$dcanx_limpo == 2),]
+
+coldata_w2_anxlimpo$dcanx_limpo <- factor(coldata_w2_anxlimpo$dcanx_limpo)
+
+table(coldata_w2_anxlimpo$dcanx_limpo)
+
+#unicount
+unicount_w2_anxlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w2_anxlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w2_anxlimpo)==rownames(coldata_w2_anxlimpo))
+
+#30 controls and 23 cases (any anx), 30 controls and 9 cases (gen anx) 
+dds_uni_w2_anxlimpo <- DESeqDataSetFromMatrix(countData = unicount_w2_anxlimpo,
+                                  colData = coldata_w2_anxlimpo,
+                                  design = ~ scaled_age + sex + dcanx_limpo)
+
+### Filtrando 75%
+keep_counts <- rowSums(counts(dds_uni_w2_anxlimpo) >= 3) >= 42
+dds_uni_w2_anxlimpo <- dds_uni_w2_anxlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w2_anxlimpo$dcanx_limpo <- relevel(dds_uni_w2_anxlimpo$dcanx_limpo, ref = "0")
+
+# lists the coefficients 75% 185 mirs = um upregulated hsa-miR-328-3p
+dds_uni_w2_anxlimpo <- DESeq(dds_uni_w2_anxlimpo)
+res <- results(dds_uni_w2_anxlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "anx_controlesLIMPOS_w2_covsexage_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+```{r}
+# anx Controles transversal w2
+# 56 controles e 26 casos
+# Limpo só na w2
+coldata_w2$dcanx_limpo <- ifelse(coldata_w2$dcanyanx == 0 & coldata_w2$dcany == 0, 0, 2)
+coldata_w2$dcanx_limpo[which(coldata_w2$dcanyanx == 0 & coldata_w2$dcany == 2)] = 1
+
+coldata_w2_anxlimpo <- coldata_w2[which(coldata_w2$dcanx_limpo == 0 | coldata_w2$dcanx_limpo == 2),]
+
+coldata_w2_anxlimpo$dcanx_limpo <- factor(coldata_w2_anxlimpo$dcanx_limpo)
+
+table(coldata_w2_anxlimpo$dcanx_limpo)
+
+#unicount
+unicount_w2_anxlimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w2_anxlimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w2_anxlimpo)==rownames(coldata_w2_anxlimpo))
+
+#30 controls and 11 cases
+dds_uni_w2_anxlimpo <- DESeqDataSetFromMatrix(countData = unicount_w2_anxlimpo,
+                                  colData = coldata_w2_anxlimpo,
+                                  design = ~ scaled_age + sex + dcanx_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w2_anxlimpo) >= 3) >= 61
+dds_uni_w2_anxlimpo <- dds_uni_w2_anxlimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w2_anxlimpo$dcanx_limpo <- relevel(dds_uni_w2_anxlimpo$dcanx_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w2_anxlimpo <- DESeq(dds_uni_w2_anxlimpo)
+res <- results(dds_uni_w2_anxlimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "mdd_controles_sujos_w2_covsexage_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+## ANY DIS W1
+```{r}
+# any CONTROLES LIMPOS w1:
+# 30 controles e 65 casos
+# Limpo só na w1
+coldata_w1$dcany_limpo <- ifelse(coldata_w1$Trajetoria == "A", 0,1)
+coldata_w1$dcany_limpo[which(coldata_w1$dcany == 2)] = 2
+
+coldata_w1_anylimpo <- coldata_w1[which(coldata_w1$dcany_limpo == 0 | coldata_w1$dcany_limpo == 2),]
+
+coldata_w1_anylimpo$dcany_limpo <- factor(coldata_w1_anylimpo$dcany_limpo)
+
+#unicount
+unicount_w1_anylimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1_anylimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1_anylimpo)==rownames(coldata_w1_anylimpo))
+
+#30 controls and 68 cases
+dds_uni_w1_anylimpo <- DESeqDataSetFromMatrix(countData = unicount_w1_anylimpo,
+                                  colData = coldata_w1_anylimpo,
+                                  design = ~ scaled_age + sex + dcany_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w1_anylimpo) >= 3) >= 73
+dds_uni_w1_anylimpo <- dds_uni_w1_anylimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w1_anylimpo$dcany_limpo <- relevel(dds_uni_w1_anylimpo$dcany_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w1_anylimpo <- DESeq(dds_uni_w1_anylimpo)
+res <- results(dds_uni_w1_anylimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "any_controlesLIMPOS_w1_covAGE_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+```{r}
+# any Controles transversal w1
+# 54 controles e 65 casos
+# Limpo só na w1
+coldata_w1$dcany_limpo <- ifelse(coldata_w1$dcany == 0, 0, 2)
+
+coldata_w1_anylimpo <- coldata_w1[which(coldata_w1$dcany_limpo == 0 | coldata_w1$dcany_limpo == 2),]
+
+coldata_w1_anylimpo$dcany_limpo <- factor(coldata_w1_anylimpo$dcany_limpo)
+
+table(coldata_w1_anylimpo$dcany_limpo)
+
+#unicount
+unicount_w1_anylimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w1_anylimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w1_anylimpo)==rownames(coldata_w1_anylimpo))
+
+#30 controls and 11 cases
+dds_uni_w1_anylimpo <- DESeqDataSetFromMatrix(countData = unicount_w1_anylimpo,
+                                  colData = coldata_w1_anylimpo,
+                                  design = ~ scaled_age + sex + dcany_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w1_anylimpo) >= 10) >= 10
+dds_uni_w1_anylimpo <- dds_uni_w1_anylimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w1_anylimpo$dcany_limpo <- relevel(dds_uni_w1_anylimpo$dcany_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w1_anylimpo <- DESeq(dds_uni_w1_anylimpo)
+res <- results(dds_uni_w1_anylimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "mdd_controlesLIMPOS_w1_covAGE_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+```
+
+
+## ANY DIS W2
+```{r}
+# any CONTROLES LIMPOS w2:
+# 30 controles e 63 casos
+# Limpo só na w2
+coldata_w2$dcany_limpo <- ifelse(coldata_w2$Trajetoria == "A", 0,1)
+coldata_w2$dcany_limpo[which(coldata_w2$dcany == 2)] = 2
+
+coldata_w2_anylimpo <- coldata_w2[which(coldata_w2$dcany_limpo == 0 | coldata_w2$dcany_limpo == 2),]
+
+coldata_w2_anylimpo$dcany_limpo <- factor(coldata_w2_anylimpo$dcany_limpo)
+
+#unicount
+unicount_w2_anylimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w2_anylimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w2_anylimpo)==rownames(coldata_w2_anylimpo))
+
+#30 controls and 68 cases
+dds_uni_w2_anylimpo <- DESeqDataSetFromMatrix(countData = unicount_w2_anylimpo,
+                                  colData = coldata_w2_anylimpo,
+                                  design = ~ scaled_age + sex + dcany_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w2_anylimpo) >= 10) >= 30
+dds_uni_w2_anylimpo <- dds_uni_w2_anylimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w2_anylimpo$dcany_limpo <- relevel(dds_uni_w2_anylimpo$dcany_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w2_anylimpo <- DESeq(dds_uni_w2_anylimpo)
+res <- results(dds_uni_w2_anylimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "any_controlesLIMPOS_w2_covAGE_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+```{r}
+# any Controles transversal w2
+# 56 controles e 63 casos
+# Limpo só na w2
+coldata_w2$dcany_limpo <- ifelse(coldata_w2$dcany == 0, 0, 2)
+
+coldata_w2_anylimpo <- coldata_w2[which(coldata_w2$dcany_limpo == 0 | coldata_w2$dcany_limpo == 2),]
+
+coldata_w2_anylimpo$dcany_limpo <- factor(coldata_w2_anylimpo$dcany_limpo)
+
+table(coldata_w2_anylimpo$dcany_limpo)
+
+#unicount
+unicount_w2_anylimpo <- unicount[, which(colnames(unicount)%in%rownames(coldata_w2_anylimpo))]
+
+#check if worked = TRUE
+all(colnames(unicount_w2_anylimpo)==rownames(coldata_w2_anylimpo))
+
+#30 controls and 11 cases
+dds_uni_w2_anylimpo <- DESeqDataSetFromMatrix(countData = unicount_w2_anylimpo,
+                                  colData = coldata_w2_anylimpo,
+                                  design = ~ scaled_age + sex + dcany_limpo)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_w2_anylimpo) >= 10) >= 50
+dds_uni_w2_anylimpo <- dds_uni_w2_anylimpo[keep_counts,]
+
+#Definir 0 = controle como ref para comparacao
+dds_uni_w2_anylimpo$dcany_limpo <- relevel(dds_uni_w2_anylimpo$dcany_limpo, ref = "0")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_w2_anylimpo <- DESeq(dds_uni_w2_anylimpo)
+res <- results(dds_uni_w2_anylimpo)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "mdd_controlesLIMPOS_w2_covAGE_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+```
+
+
+
+#DESENHOS PAREADOS
+### MDD incidente
+```{r}
+# MDD controles limpos incidente
+coldata_B$dcmdd_limpo <- ifelse(coldata_B$dcmadep == 0 & coldata_B$dcanyanx == 0 & coldata_B$dcgena == 0 & coldata_B$dcanyhk == 0 & coldata_B$dcpsych == 0 & coldata_B$dcmania == 0, 0, 1)
+coldata_B$dcmdd_limpo[which(coldata_B$dcmadep == 2)] = 2
+
+
+selecionados_mdd_incidente <- coldata_B[which(coldata_B$dcmdd_limpo == 2),]
+
+coldata_B_mdd <- coldata_B[coldata_B$subjectid %in% selecionados_mdd_incidente$subjectid,]
+
+#unicount
+unicount_B_mdd <- unicount[, which(colnames(unicount)%in%rownames(coldata_B_mdd))]
+
+#check if worked = TRUE
+all(colnames(unicount_B_mdd)==rownames(coldata_B_mdd))
+
+#25 conversoes mdd
+dds_uni_B_mdd <- DESeqDataSetFromMatrix(countData = unicount_B_mdd,
+                                  colData = coldata_B_mdd,
+                                  design = ~ subjectid + wave)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_B_mdd) >= 3) >= 37
+dds_uni_B_mdd <- dds_uni_B_mdd[keep_counts,]
+
+
+#Definir "w1" como ref para comparacao
+dds_uni_B_mdd$wave <- relevel(dds_uni_B_mdd$wave, ref = "w1")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_B_mdd <- DESeq(dds_uni_B_mdd)
+res <- results(dds_uni_B_mdd)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "mdd_incidentes_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+
+```
+### MDD remitente
+```{r}
+# MDD remitente
+coldata_C$dcmdd_limpo <- ifelse(coldata_C$dcmadep == 0 & coldata_C$dcanyanx == 0 & coldata_C$dcgena == 0 & coldata_C$dcanyhk == 0 & coldata_C$dcpsych == 0 & coldata_C$dcmania == 0, 0, 1)
+coldata_C$dcmdd_limpo[which(coldata_C$dcmadep == 2)] = 2
+
+
+selecionados_mdd_remitente <- coldata_C[which(coldata_C$dcmdd_limpo == 2),]
+
+coldata_C_mdd <- coldata_C[coldata_C$subjectid %in% selecionados_mdd_remitente$subjectid,]
+
+#unicount
+unicount_C_mdd <- unicount[, which(colnames(unicount)%in%rownames(coldata_C_mdd))]
+
+#check if worked = TRUE
+all(colnames(unicount_C_mdd)==rownames(coldata_C_mdd))
+
+#11 remissoes mdd
+dds_uni_C_mdd <- DESeqDataSetFromMatrix(countData = unicount_C_mdd,
+                                  colData = coldata_C_mdd,
+                                  design = ~ subjectid + dcmadep + wave + dcmadep:wave)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_C_mdd) >= 3) >= 16
+dds_uni_C_mdd <- dds_uni_C_mdd[keep_counts,]
+
+
+#Definir "w1" como ref para comparacao
+dds_uni_C_mdd$wave <- relevel(dds_uni_C_mdd$wave, ref = "w1")
+
+#
+dds_uni_C_mdd <- DESeq(dds_uni_C_mdd)
+res <- results(dds_uni_C_mdd)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "mdd_remitentes_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+
+```
+
+### adhd incidente
+```{r}
+# adhd controles limpos incidente
+coldata_B$dcadhd_limpo <- ifelse(coldata_B$dcmadep == 0 & coldata_B$dcanyanx == 0 & coldata_B$dcgena == 0 & coldata_B$dcanyhk == 0 & coldata_B$dcpsych == 0 & coldata_B$dcmania == 0, 0, 1)
+coldata_B$dcadhd_limpo[which(coldata_B$dcanyhk == 2)] = 2
+
+selecionados_adhd_incidente <- coldata_B[which(coldata_B$dcadhd_limpo == 2),]
+
+coldata_B_adhd <- coldata_B[coldata_B$subjectid %in% selecionados_adhd_incidente$subjectid,]
+
+#unicount
+unicount_B_adhd <- unicount[, which(colnames(unicount)%in%rownames(coldata_B_adhd))]
+
+#check if worked = TRUE
+all(colnames(unicount_B_adhd)==rownames(coldata_B_adhd))
+
+#4 conversoes adhd
+dds_uni_B_adhd <- DESeqDataSetFromMatrix(countData = unicount_B_adhd,
+                                  colData = coldata_B_adhd,
+                                  design = ~ subjectid + wave)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_B_adhd) >= 3) >= 6
+dds_uni_B_adhd <- dds_uni_B_adhd[keep_counts,]
+
+
+#Definir "w1" como ref para comparacao
+dds_uni_B_adhd$wave <- relevel(dds_uni_B_adhd$wave, ref = "w1")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_B_adhd <- DESeq(dds_uni_B_adhd)
+res <- results(dds_uni_B_adhd)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "adhd_incidentes_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+
+```
+### adhd remitente
+```{r}
+# adhd remitente
+coldata_C$dcadhd_limpo <- ifelse(coldata_C$dcmadep == 0 & coldata_C$dcanyanx == 0 & coldata_C$dcgena == 0 & coldata_C$dcanyhk == 0 & coldata_C$dcpsych == 0 & coldata_C$dcmania == 0, 0, 1)
+coldata_C$dcadhd_limpo[which(coldata_C$dcanyhk == 2)] = 2
+
+
+selecionados_adhd_remitente <- coldata_C[which(coldata_C$dcadhd_limpo == 2),]
+
+coldata_C_adhd <- coldata_C[coldata_C$subjectid %in% selecionados_adhd_remitente$subjectid,]
+
+#unicount
+unicount_C_adhd <- unicount[, which(colnames(unicount)%in%rownames(coldata_C_adhd))]
+
+#check if worked = TRUE
+all(colnames(unicount_C_adhd)==rownames(coldata_C_adhd))
+
+#11 remissoes adhd
+dds_uni_C_adhd <- DESeqDataSetFromMatrix(countData = unicount_C_adhd,
+                                  colData = coldata_C_adhd,
+                                  design = ~ subjectid + wave)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_C_adhd) >= 3) > 13
+dds_uni_C_adhd <- dds_uni_C_adhd[keep_counts,]
+
+
+#Definir "w1" como ref para comparacao
+dds_uni_C_adhd$wave <- relevel(dds_uni_C_adhd$wave, ref = "w1")
+
+#
+dds_uni_C_adhd <- DESeq(dds_uni_C_adhd)
+res <- results(dds_uni_C_adhd)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "adhd_remitentes_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+
+```
+
+
+### anx incidente ***
+```{r}
+# anx controles limpos incidente
+coldata_B$dcanx_limpo <- ifelse(coldata_B$dcmadep == 0 & coldata_B$dcanyanx == 0 & coldata_B$dcgena == 0 & coldata_B$dcanyhk == 0 & coldata_B$dcpsych == 0 & coldata_B$dcmania == 0, 0, 1)
+coldata_B$dcanx_limpo[which(coldata_B$dcanyanx == 2)] = 2
+
+
+selecionados_anx_incidente <- coldata_B[which(coldata_B$dcanx_limpo == 2),]
+
+coldata_B_anx <- coldata_B[coldata_B$subjectid %in% selecionados_anx_incidente$subjectid,]
+
+#unicount
+unicount_B_anx <- unicount[, which(colnames(unicount)%in%rownames(coldata_B_anx))]
+
+#check if worked = TRUE
+all(colnames(unicount_B_anx)==rownames(coldata_B_anx))
+
+#25 conversoes anx
+dds_uni_B_anx <- DESeqDataSetFromMatrix(countData = unicount_B_anx,
+                                  colData = coldata_B_anx,
+                                  design = ~ subjectid + wave)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_B_anx) >= 3) >= 24
+dds_uni_B_anx <- dds_uni_B_anx[keep_counts,]
+
+
+#Definir "w1" como ref para comparacao
+dds_uni_B_anx$wave <- relevel(dds_uni_B_anx$wave, ref = "w1")
+
+# lists the coefficients 10 ind = 402 mirs;75% (>70 ind) = 172 mirs
+dds_uni_B_anx <- DESeq(dds_uni_B_anx)
+res <- results(dds_uni_B_anx)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "anx_incidentes_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+
+```
+### anx remitente
+```{r}
+# anx remitente
+coldata_C$dcanx_limpo <- ifelse(coldata_C$dcmadep == 0 & coldata_C$dcanyanx == 0 & coldata_C$dcgena == 0 & coldata_C$dcanyhk == 0 & coldata_C$dcpsych == 0 & coldata_C$dcmania == 0, 0, 1)
+coldata_C$dcanx_limpo[which(coldata_C$dcanyanx == 2)] = 2
+
+
+selecionados_anx_remitente <- coldata_C[which(coldata_C$dcanx_limpo == 2),]
+
+coldata_C_anx <- coldata_C[coldata_C$subjectid %in% selecionados_anx_remitente$subjectid,]
+
+#unicount
+unicount_C_anx <- unicount[, which(colnames(unicount)%in%rownames(coldata_C_anx))]
+
+#check if worked = TRUE
+all(colnames(unicount_C_anx)==rownames(coldata_C_anx))
+
+#11 remissoes anx
+dds_uni_C_anx <- DESeqDataSetFromMatrix(countData = unicount_C_anx,
+                                  colData = coldata_C_anx,
+                                  design = ~ subjectid + wave)
+
+### Filtrando 10%
+keep_counts <- rowSums(counts(dds_uni_C_anx) >= 10) >= 19
+dds_uni_C_anx <- dds_uni_C_anx[keep_counts,]
+
+
+#Definir "w1" como ref para comparacao
+dds_uni_C_anx$wave <- relevel(dds_uni_C_anx$wave, ref = "w1")
+
+#
+dds_uni_C_anx <- DESeq(dds_uni_C_anx)
+res <- results(dds_uni_C_anx)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered, "anx_remitentes_filter75.tsv", col.names=T, row.names=T, quote=F, sep="\t")
+
+
+```
+
+
+
+
+### Todos W1 x W2
+```{r}
+# arrumar os tipos de vars
+# assure coldata vars are correct type #tem que vie depois da subdividao
+coldata$wave <- factor(coldata$wave)
+coldata$sex <- factor(coldata$sex)
+coldata$age <- as.numeric(coldata$age)
+coldata$bage <- as.numeric(coldata$bage)
+coldata$Trajetoria <- factor(coldata$Trajetoria)
+coldata$isol_batch <- factor(coldata$isol_batch)
+coldata$batch <- factor(coldata$batch) #seq batch
+coldata$subjectid <- factor(coldata$subjectid)
+```
+
+Análise diferencial
+```{r}
+coldata$scaled_age <- scale(coldata$age)
+
+dds_uni_geral <- DESeqDataSetFromMatrix(countData = unicount,
+                                  colData = coldata,
+                                  design = ~ subjectid + wave)
+### Filtrando 75%
+keep_counts <- rowSums(counts(dds_uni_geral) >= 3) >= 178
+dds_uni_geral <- dds_uni_geral[keep_counts,]
+
+# lists the coefficients
+dds_uni_geral <- DESeq(dds_uni_geral)
+res <- results(dds_uni_geral)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:20),], "allsamples_filter75percent.txt", col.names=T, row.names=T, quote=F)
+
+
+# Filtrando 10%
+dds_uni_geral <- DESeqDataSetFromMatrix(countData = unicount,
+                                  colData = coldata,
+                                  design = ~ subjectid + wave)
+keep_counts <- rowSums(counts(dds_uni_geral) >= 3) >= 19
+dds_uni_geral <- dds_uni_geral[keep_counts,]
+
+# lists the coefficients
+dds_uni_geral <- DESeq(dds_uni_geral)
+res <- results(dds_uni_geral)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:20),], "allsamples_filter10percent.txt", col.names=T, row.names=T, quote=F)
+
+```
+
+## todos w1 x w2 com sexo separado
+# masculino
+```{r}
+# Separe coldata and unicount for each group paired analyis
+coldata_male <- coldata[coldata$sex==1,]
+unicount_male <- unicount[, which(colnames(unicount)%in%rownames(coldata_male))]
+
+#check if worked = TRUE
+all(colnames(unicount_male)==rownames(coldata_male))
+
+```
+
+```{r}
+# arrumar os tipos de vars
+# assure coldata vars are correct type #tem que vie depois da subdividao
+coldata_male$wave <- factor(coldata_male$wave)
+coldata_male$sex <- factor(coldata_male$sex)
+coldata_male$age <- as.numeric(coldata_male$age)
+coldata_male$bage <- as.numeric(coldata_male$bage)
+coldata_male$Trajetoria <- factor(coldata_male$Trajetoria)
+coldata_male$isol_batch <- factor(coldata_male$isol_batch)
+coldata_male$batch <- factor(coldata_male$batch) #seq batch
+coldata_male$subjectid <- factor(coldata_male$subjectid)
+```
+
+Análise diferencial
+```{r}
+coldata_male$scaled_age <- scale(coldata_male$age)
+
+
+dds_uni_male <- DESeqDataSetFromMatrix(countData = unicount_male,
+                                  colData = coldata_male,
+                                  design = ~ subjectid + wave)
+#geral era 168 de 1555
+#Selecionar apenas miRNAs com pelo menos 75% amostras com no minimo 3 reads ##168 de 1555
+keep_counts <- rowSums(counts(dds_uni_male) >= 3) >= 99
+dds_uni_male <- dds_uni_male[keep_counts,]
+
+#Definir "w1" como ref para comparacao
+dds_uni_male$wave <- relevel(dds_uni_male$wave, ref = "w1")
+#results(dds, c("condition", "A", "C"))
+
+# lists the coefficients
+dds_uni_male <- DESeq(dds_uni_male)
+results(dds_uni_male)
+res <- results(dds_uni_male)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.table(resOrdered[c(1:10),], "male_pareado_filter3reads_75percent.txt", col.names=T, row.names=T, quote=F)
+```
+# feminino
+
+```{r}
+# Separe coldata and unicount for each group paired analyis
+coldata_female <- coldata[coldata$sex==2,]
+unicount_female <- unicount[, which(colnames(unicount)%in%rownames(coldata_female))]
+
+#check if worked = TRUE
+all(colnames(unicount_female)==rownames(coldata_female))
+
+```
+
+```{r}
+# arrumar os tipos de vars
+# assure coldata vars are correct type #tem que vie depois da subdividao
+coldata_female$wave <- factor(coldata_female$wave)
+coldata_female$sex <- factor(coldata_female$sex)
+coldata_female$age <- as.numeric(coldata_female$age)
+coldata_female$bage <- as.numeric(coldata_female$bage)
+coldata_female$Trajetoria <- factor(coldata_female$Trajetoria)
+coldata_female$isol_batch <- factor(coldata_female$isol_batch)
+coldata_female$batch <- factor(coldata_female$batch) #seq batch
+coldata_female$subjectid <- factor(coldata_female$subjectid)
+```
+
+Análise diferencial
+```{r}
+coldata_female$scaled_age <- scale(coldata_female$age)
+
+
+dds_uni_female <- DESeqDataSetFromMatrix(countData = unicount_female,
+                                  colData = coldata_female,
+                                  design = ~ subjectid + wave)
+#geral era 168 de 1555
+#Selecionar apenas miRNAs com pelo menos 75% amostras com no minimo 3 reads ##163 de 1555
+keep_counts <- rowSums(counts(dds_uni_female) >= 3) >= 79
+dds_uni_female <- dds_uni_female[keep_counts,]
+
+#Definir "w1" como ref para comparacao
+dds_uni_female$wave <- relevel(dds_uni_female$wave, ref = "w1")
+#results(dds, c("condition", "A", "C"))
+
+# lists the coefficients
+dds_uni_female <- DESeq(dds_uni_female)
+results(dds_uni_female)
+res <- results(dds_uni_female)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.csv(x = resOrdered, file = "resOrdered.csv")
+```
+
+### Paired analysis per group
+
+```{r}
+# Separe coldata and unicount for each group paired analyis
+coldata_A <- coldata[coldata$Trajetoria=="A",]
+coldata_B <- coldata[coldata$Trajetoria=="B",]
+coldata_C <- coldata[coldata$Trajetoria=="C",]
+coldata_D <- coldata[coldata$Trajetoria=="D",]
+
+unicount_A <- unicount[, which(colnames(unicount)%in%rownames(coldata_A))]
+unicount_B <- unicount[, which(colnames(unicount)%in%rownames(coldata_B))]
+unicount_C <- unicount[, which(colnames(unicount)%in%rownames(coldata_C))]
+unicount_D <- unicount[, which(colnames(unicount)%in%rownames(coldata_D))]
+
+#check if worked = TRUE
+all(colnames(unicount_A)==rownames(coldata_A))
+all(colnames(unicount_B)==rownames(coldata_B))
+all(colnames(unicount_C)==rownames(coldata_C))
+all(colnames(unicount_D)==rownames(coldata_D))
+
+```
+## Incidentes
+```{r}
+# arrumar os tipos de vars
+# assure coldata vars are correct type #tem que vie depois da subdividao
+coldata_B$wave <- factor(coldata_B$wave)
+coldata_B$sex <- factor(coldata_B$sex)
+coldata_B$age <- as.numeric(coldata_B$age)
+coldata_B$bage <- as.numeric(coldata_B$bage)
+coldata_B$Trajetoria <- factor(coldata_B$Trajetoria)
+coldata_B$isol_batch <- factor(coldata_B$isol_batch)
+coldata_B$batch <- factor(coldata_B$batch) #seq batch
+coldata_B$subjectid <- factor(coldata_B$subjectid)
+```
+
+Análise diferencial
+```{r}
+coldata_B$scaled_age <- scale(coldata_B$age)
+
+
+dds_uni_B <- DESeqDataSetFromMatrix(countData = unicount_B,
+                                  colData = coldata_B,
+                                  design = ~ subjectid + wave)
+#geral era 168 de 1555
+#Selecionar apenas miRNAs com pelo menos 75% amostras com no minimo 3 reads ##163 de 1555
+keep_counts <- rowSums(counts(dds_uni_B) >= 3) >= 51
+dds_uni_B <- dds_uni_B[keep_counts,]
+
+#Definir "w1" como ref para comparacao
+dds_uni_B$wave <- relevel(dds_uni_B$wave, ref = "w1")
+#results(dds, c("condition", "A", "C"))
+
+# lists the coefficients
+dds_uni_B <- DESeq(dds_uni_B)
+results(dds_uni_B)
+res <- results(dds_uni_B)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.csv(x = resOrdered, file = "resOrdered.csv")
+```
+
+## Remitentes
+```{r}
+# arrumar os tipos de vars
+# assure coldata vars are correct type #tem que vie depois da subdividao
+coldata_C$wave <- factor(coldata_C$wave)
+coldata_C$sex <- factor(coldata_C$sex)
+coldata_C$age <- as.numeric(coldata_C$age)
+coldata_C$bage <- as.numeric(coldata_C$bage)
+coldata_C$Trajetoria <- factor(coldata_C$Trajetoria)
+coldata_C$isol_batch <- factor(coldata_C$isol_batch)
+coldata_C$batch <- factor(coldata_C$batch) #seq batch
+coldata_C$subjectid <- factor(coldata_C$subjectid)
+```
+
+Análise diferencial
+```{r}
+coldata_C$scaled_age <- scale(coldata_C$age)
+
+dds_uni_C <- DESeqDataSetFromMatrix(countData = unicount_C,
+                                  colData = coldata_C,
+                                  design = ~ subjectid + wave)
+#geral era 168 de 1555
+#Selecionar apenas miRNAs com pelo menos 75% amostras com no minimo 3 reads ##169 de 1555
+keep_counts <- rowSums(counts(dds_uni_C) >= 3) >= 43
+dds_uni_C <- dds_uni_C[keep_counts,]
+
+#Definir "w1" como ref para comparacao
+dds_uni_C$wave <- relevel(dds_uni_C$wave, ref = "w1")
+#results(dds, c("condition", "A", "C"))
+
+# lists the coefficients
+dds_uni_C <- DESeq(dds_uni_C)
+res <- results(dds_uni_C)
+summary(results(dds_uni_C))
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+
+```
+
+## Persistentes
+```{r}
+# arrumar os tipos de vars
+# assure coldata vars are correct type #tem que vie depois da subdividao
+coldata_D$wave <- factor(coldata_D$wave)
+coldata_D$sex <- factor(coldata_D$sex)
+coldata_D$age <- as.numeric(coldata_D$age)
+coldata_D$bage <- as.numeric(coldata_D$bage)
+coldata_D$Trajetoria <- factor(coldata_D$Trajetoria)
+coldata_D$isol_batch <- factor(coldata_D$isol_batch)
+coldata_D$batch <- factor(coldata_D$batch) #seq batch
+coldata_D$subjectid <- factor(coldata_D$subjectid)
+```
+
+Análise diferencial
+```{r}
+coldata_D$scaled_age <- scale(coldata_D$age)
+
+dds_uni_D <- DESeqDataSetFromMatrix(countData = unicount_D,
+                                  colData = coldata_D,
+                                  design = ~ subjectid + wave)
+#geral era 168 de 1555
+#Selecionar apenas miRNAs com pelo menos 75% amostras com no minimo 3 reads ##179 de 1555
+keep_counts <- rowSums(counts(dds_uni_D) >= 3) >= 39
+dds_uni_D <- dds_uni_D[keep_counts,]
+
+#Definir "w1" como ref para comparacao
+dds_uni_D$wave <- relevel(dds_uni_D$wave, ref = "w1")
+#results(dds, c("condition", "A", "D"))
+
+# lists the coefficients
+dds_uni_D <- DESeq(dds_uni_D)
+res <- results(dds_uni_D)
+summary(results(dds_uni_D))
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+
+```
+
+##  Controles
+```{r}
+# arrumar os tipos de vars
+# assure coldata vars are correct type #tem que vie depois da subdividao
+coldata_A$wave <- factor(coldata_A$wave)
+coldata_A$sex <- factor(coldata_A$sex)
+coldata_A$age <- as.numeric(coldata_A$age)
+coldata_A$bage <- as.numeric(coldata_A$bage)
+coldata_A$Trajetoria <- factor(coldata_A$Trajetoria)
+coldata_A$isol_batch <- factor(coldata_A$isol_batch)
+coldata_A$batch <- factor(coldata_A$batch) #seq batch
+coldata_A$subjectid <- factor(coldata_A$subjectid)
+```
+
+Análise diferencial
+```{r}
+coldata_A$scaled_age <- scale(coldata_A$age)
+
+dds_uni_A <- DESeqDataSetFromMatrix(countData = unicount_A,
+                                  colData = coldata_A,
+                                  design = ~ subjectid  + wave)
+#geral era 168 de 1555
+#Selecionar apenas miRNAs com pelo menos 18 amostras com no minimo 3 reads ##183 de 1555
+keep_counts <- rowSums(counts(dds_uni_A) >= 3) >= 45
+dds_uni_A <- dds_uni_A[keep_counts,]
+
+#Definir "w1" como ref para comparacao
+dds_uni_A$wave <- relevel(dds_uni_A$wave, ref = "w1")
+#results(dds, c("condition", "A", "C"))
+
+# lists the coefficients
+dds_uni_A <- DESeq(dds_uni_A)
+res <- results(dds_uni_A)
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+```
+QC
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+# Input is a matrix of log transformed values
+rld <- rlog(dds_uni_A, blind=T) 
+
+plotPCA(rld, intgroup="Trajetoria")
+plotPCA(rld, intgroup="sex")
+plotPCA(rld, intgroup="batch")
+plotPCA(rld, intgroup="isol_batch")
+plotPCA(rld, intgroup="wave")
+plotPCA(rld, intgroup="subjectid")
+
+#NOTE: The plotPCA() function will only return the values for PC1 and PC2. If you would like to explore the additional PCs in your data or if you would like to identify genes that contribute most to the PCs, you can use the prcomp() function. For example, to plot any of the PCs we could run the following code:
+  
+# Input is a matrix of log transformed values
+rld_mat <- assay(rld)
+pca <- prcomp(t(rld_mat))
+# Create data frame with metadata and PC3 and PC4 values for input to ggplot
+#wave
+df <- cbind(coldata_A, pca$x)
+PC1toPC5_var<- pca$sdev*pca$sdev
+PC1toPC5_per <- round(PC1toPC5_var/sum(PC1toPC5_var)*100,1)
+pc1 <- ggplot(df) + geom_point(aes(x=PC1, y=PC2, col = Trajetoria), size = 1) +xlab(paste("PC1 - ", PC1toPC5_per[1], "%", sep = "")) + ylab(paste("PC2 - ", PC1toPC5_per[2], "%", sep = ""))
+pc2 <- ggplot(df) + geom_point(aes(x=PC2, y=PC3, col = Trajetoria), size = 1)+ xlab(paste("PC2 - ", PC1toPC5_per[2], "%", sep = "")) + ylab(paste("PC3 - ", PC1toPC5_per[3], "%", sep = ""))
+library(ggpubr)
+pc3 <- ggplot(df) + geom_point(aes(x=PC3, y=PC4, col = Trajetoria), size = 1) +xlab(paste("PC3 - ", PC1toPC5_per[3], "%", sep = "")) + ylab(paste("PC4 - ", PC1toPC5_per[4], "%", sep = ""))
+pc4 <- ggplot(df) + geom_point(aes(x=PC4, y=PC5, col = Trajetoria), size = 1) +xlab(paste("PC4 - ", PC1toPC5_per[4], "%", sep = "")) + ylab(paste("PC5 - ", PC1toPC5_per[5], "%", sep = ""))
+
+pdf(file="pca_Traj.pdf")
+ggarrange(pc1, pc2, pc3, pc4,common.legend = TRUE,
+          labels = c("A", "B", "C", "D"), ncol = 2, nrow = 2)
+dev.off()
+
+#sexo
+df <- cbind(coldata_A, pca$x)
+PC1toPC5_var<- pca$sdev*pca$sdev
+PC1toPC5_per <- round(PC1toPC5_var/sum(PC1toPC5_var)*100,1)
+pc1 <- ggplot(df) + geom_point(aes(x=PC1, y=PC2, col = Trajetoria), size = 1) +xlab(paste("PC1 - ", PC1toPC5_per[1], "%", sep = "")) + ylab(paste("PC2 - ", PC1toPC5_per[2], "%", sep = ""))
+pc2 <- ggplot(df) + geom_point(aes(x=PC2, y=PC3, col = Trajetoria), size = 1)+ xlab(paste("PC2 - ", PC1toPC5_per[2], "%", sep = "")) + ylab(paste("PC3 - ", PC1toPC5_per[3], "%", sep = ""))
+library(ggpubr)
+pc3 <- ggplot(df) + geom_point(aes(x=PC3, y=PC4, col = Trajetoria), size = 1) +xlab(paste("PC3 - ", PC1toPC5_per[3], "%", sep = "")) + ylab(paste("PC4 - ", PC1toPC5_per[4], "%", sep = ""))
+pc4 <- ggplot(df) + geom_point(aes(x=PC4, y=PC5, col = Trajetoria), size = 1) +xlab(paste("PC4 - ", PC1toPC5_per[4], "%", sep = "")) + ylab(paste("PC5 - ", PC1toPC5_per[5], "%", sep = ""))
+
+pdf(file="pca_Traj.pdf")
+ggarrange(pc1, pc2, pc3, pc4,common.legend = TRUE,
+          labels = c("A", "B", "C", "D"), ncol = 2, nrow = 2)
+dev.off()
+
+```
+
+
+PCA-outramaneira
+```{r}
+## para calcular a % que o PC representa:
+
+pca_condition_uni <- counts(dds_uni, normalized=T)
+pca_cond_uni <- prcomp(t(pca_condition_uni))
+
+pca_cond.var_uni <- pca_cond_uni$sdev^2
+pca_cond.var.per_uni <- round(pca_cond.var_uni/sum(pca_cond.var_uni)*100,1)
+
+### PCA - Batch effect ###
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,1], Y=pca_cond_uni$x[,2])
+pdf("pca1x2_batch_uninormalized.pdf")
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sampleinfo_todosgroup$batch)) +
+  geom_text() +
+  xlab(paste("PC1 - ", pca_cond.var.per_uni[1], "%", sep = "")) +
+  ylab(paste("PC2 - ", pca_cond.var.per_uni[2], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Batch") +
+  labs(title = "PCA - Batch Effect",
+       subtitle = "Plot of PC1 x PC2, coloured by Sequencing Batch") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+dev.off()
+
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,2], Y=pca_cond_uni$x[,3])
+pdf("pca2x3_batch_uninormalized.pdf")
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sampleinfo_todosgroup$batch)) +
+  geom_text() +
+  xlab(paste("PC2 - ", pca_cond.var.per_uni[2], "%", sep = "")) +
+  ylab(paste("PC3 - ", pca_cond.var.per_uni[3], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Batch") +
+  labs(title = "PCA - Batch Effect",
+       subtitle = "Plot of PC2 x PC3, coloured by ext Batch") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+dev.off()
+
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,3], Y=pca_cond_uni$x[,4])
+pdf("pca3x4_batch_uninormalized.pdf")
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sampleinfo_todosgroup$batch)) +
+  geom_text() +
+  xlab(paste("PC3 - ", pca_cond.var.per_uni[3], "%", sep = "")) +
+  ylab(paste("PC4 - ", pca_cond.var.per_uni[4], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Batch") +
+  labs(title = "PCA - Batch Effect",
+       subtitle = "Plot of PC3 x PC4, coloured by Sequencing Batch") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+dev.off()
+
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,1], Y=pca_cond_uni$x[,3])
+pdf("pca1x3_batch_uninormalized.pdf")
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sampleinfo_todosgroup$batch)) +
+  geom_text() +
+  xlab(paste("PC1 - ", pca_cond.var.per_uni[1], "%", sep = "")) +
+  ylab(paste("PC3 - ", pca_cond.var.per_uni[3], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Batch") +
+  labs(title = "PCA - Batch Effect",
+       subtitle = "Plot of PC1 x PC3, coloured by Sequencing Batch") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+dev.off()
+
+### PCA - SEXO ###
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,1], Y=pca_cond_uni$x[,2])
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sdesign$Sex)) +
+  geom_text() +
+  xlab(paste("PC1 - ", pca_cond.var.per_uni[1], "%", sep = "")) +
+  ylab(paste("PC2 - ", pca_cond.var.per_uni[2], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Sex") +
+  labs(title = "PCA - Sex",
+       subtitle = "Plot of PC1 x PC2, coloured by Sex") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,2], Y=pca_cond_uni$x[,3])
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sdesign_uni$Sex)) +
+  geom_text() +
+  xlab(paste("PC2 - ", pca_cond.var.per_uni[2], "%", sep = "")) +
+  ylab(paste("PC3 - ", pca_cond.var.per_uni[3], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Sex") +
+  labs(title = "PCA - Sex",
+       subtitle = "Plot of PC2 x PC3, coloured by Sex") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,3], Y=pca_cond_uni$x[,4])
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sdesign_uni$Sex)) +
+  geom_text() +
+  xlab(paste("PC3 - ", pca_cond.var.per_uni[3], "%", sep = "")) +
+  ylab(paste("PC4 - ", pca_cond.var.per_uni[4], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Sex") +
+  labs(title = "PCA - Sex",
+       subtitle = "Plot of PC3 x PC4, coloured by Sex") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,1], Y=pca_cond_uni$x[,3])
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sdesign_uni$Sex)) +
+  geom_text() +
+  xlab(paste("PC1 - ", pca_cond.var.per_uni[1], "%", sep = "")) +
+  ylab(paste("PC3 - ", pca_cond.var.per_uni[3], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Sex") +
+  labs(title = "PCA - Sex",
+       subtitle = "Plot of PC1 x PC3, coloured by Sex") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+### PCA - CONDITION ###
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,1], Y=pca_cond_uni$x[,2])
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sdesign$condition)) +
+  geom_text() +
+  xlab(paste("PC1 - ", pca_cond.var.per_uni[1], "%", sep = "")) +
+  ylab(paste("PC2 - ", pca_cond.var.per_uni[2], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Condition") +
+  labs(title = "PCA - Condition",
+       subtitle = "Plot of PC1 x PC2, coloured by Condition") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,2], Y=pca_cond_uni$x[,3])
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sdesign_uni$condition)) +
+  geom_text() +
+  xlab(paste("PC2 - ", pca_cond.var.per_uni[2], "%", sep = "")) +
+  ylab(paste("PC3 - ", pca_cond.var.per_uni[3], "%", sep = "")) + 
+  theme_bw() +
+  labs(title = "PCA - Condition",
+       subtitle = "Plot of PC2 x PC3, coloured by Condition") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,3], Y=pca_cond_uni$x[,4])
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sdesign_uni$condition)) +
+  geom_text() +
+  xlab(paste("PC3 - ", pca_cond.var.per_uni[3], "%", sep = "")) +
+  ylab(paste("PC4 - ", pca_cond.var.per_uni[4], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Condition") +
+  labs(title = "PCA - Condition",
+       subtitle = "Plot of PC3 x PC4, coloured by Condition") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+pca_cond.data_uni <- data.frame(Sample = rownames(pca_cond_uni$x), X=pca_cond_uni$x[,1], Y=pca_cond_uni$x[,3])
+ggplot(data = pca_cond.data_uni, aes(x = X, y = Y, label = Sample, color = sdesign_uni$condition)) +
+  geom_text() +
+  xlab(paste("PC1 - ", pca_cond.var.per_uni[1], "%", sep = "")) +
+  ylab(paste("PC3 - ", pca_cond.var.per_uni[3], "%", sep = "")) + 
+  theme_bw() +
+  labs(colour = "Condition") +
+  labs(title = "PCA - Condition",
+       subtitle = "Plot of PC1 x PC3, coloured by Condition") +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+Hierarchical Clustering
+
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+
+library("pheatmap")
+
+### Extract the rlog matrix from the object
+rld_mat <- assay(rld)  
+
+### Compute pairwise correlation values
+rld_cor <- cor(rld_mat)    ## cor() is a base R function
+
+### Plot heatmap
+df <- as.data.frame(colData(dds_uni_A)[,c("sex","wave")])
+pheatmap(rld_cor, annotation_col= df)
+
+
+##Heatmap##
+select_uni <- order(rowMeans(counts(dds_uni_A,normalized=TRUE)),decreasing=TRUE)[1:50]
+
+df_uni <- as.data.frame(colData(dds_uni_A)[,c("sex","wave")])
+
+rownames(df_uni) <- gsub("[:MIMAT].*", "", rownames(df_uni))
+rownames(ntd_uni) <- gsub("[:MIMAT].*", "", rownames(ntd_uni))
+colnames(ntd_uni) <- gsub("[:Total].*","", colnames(ntd_uni))
+
+pheatmap(assay(df_uni)[select_uni,], cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df_uni, fontsize_row=8, fontsize_col
+         =8, main="Heatmap - top 50 expressed miRNA")
+
+```
+
+
+----
+
+### QC geral
+
+Running DESeqDataSetFromMatrix to generate the object class from deseq that stores the read counts and the intermediate estimated quantities during statistical analysis (`dds_uni`) = this now for QC. I made a paired model with isolation batch, sex, age and subject (paired var)
+
+```{r include = TRUE, message=FALSE, warning=FALSE}
+dds_uni_qc <- DESeqDataSetFromMatrix(countData = unicount,
+                                  colData = coldata,
+                                  design = ~ sex + batch + wave + subjectid)
+
+##  TO-DO checar isso de centralizar e escalar a variável numerica
+
+
+#Selecionar apenas miRNAs com pelo menos 18 amostras com no minimo 3 reads ##168 de 1555
+keep_counts <- rowSums(counts(dds_uni_qc) >= 3) >= 180
+dds_uni_qc <- dds_uni_qc[keep_counts,]
+
+```
+
+# Principal Component Analysis
+
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+# Input is a matrix of log transformed values
+rld <- rlog(dds_uni_qc, blind=T) 
+
+plotPCA(rld, intgroup="Trajetoria")
+plotPCA(rld, intgroup="sex")
+plotPCA(rld, intgroup="batch")
+plotPCA(rld, intgroup="isol_batch")
+plotPCA(rld, intgroup="wave")
+plotPCA(rld, intgroup="subjectid")
+
+#NOTE: The plotPCA() function will only return the values for PC1 and PC2. If you would like to explore the additional PCs in your data or if you would like to identify genes that contribute most to the PCs, you can use the prcomp() function. For example, to plot any of the PCs we could run the following code:
+  
+# Input is a matrix of log transformed values
+rld_mat <- assay(rld)
+pca <- prcomp(t(rld_mat))
+# Create data frame with metadata and PC3 and PC4 values for input to ggplot
+#grupo
+df <- cbind(coldata, pca$x)
+PC1toPC5_var<- pca$sdev*pca$sdev
+PC1toPC5_per <- round(PC1toPC5_var/sum(PC1toPC5_var)*100,1)
+pc1 <- ggplot(df) + geom_point(aes(x=PC1, y=PC2, col = Trajetoria), size = 1) +xlab(paste("PC1 - ", PC1toPC5_per[1], "%", sep = "")) + ylab(paste("PC2 - ", PC1toPC5_per[2], "%", sep = ""))
+pc2 <- ggplot(df) + geom_point(aes(x=PC2, y=PC3, col = Trajetoria), size = 1)+ xlab(paste("PC2 - ", PC1toPC5_per[2], "%", sep = "")) + ylab(paste("PC3 - ", PC1toPC5_per[3], "%", sep = ""))
+library(ggpubr)
+pc3 <- ggplot(df) + geom_point(aes(x=PC3, y=PC4, col = Trajetoria), size = 1) +xlab(paste("PC3 - ", PC1toPC5_per[3], "%", sep = "")) + ylab(paste("PC4 - ", PC1toPC5_per[4], "%", sep = ""))
+pc4 <- ggplot(df) + geom_point(aes(x=PC4, y=PC5, col = Trajetoria), size = 1) +xlab(paste("PC4 - ", PC1toPC5_per[4], "%", sep = "")) + ylab(paste("PC5 - ", PC1toPC5_per[5], "%", sep = ""))
+
+pdf(file="pca_Traj.pdf")
+ggarrange(pc1, pc2, pc3, pc4,common.legend = TRUE,
+          labels = c("A", "B", "C", "D"), ncol = 2, nrow = 2)
+dev.off()
+
+```
+
+# Hierarchical Clustering
+
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+
+library("pheatmap")
+
+### Extract the rlog matrix from the object
+rld_mat <- assay(rld)  
+
+### Compute pairwise correlation values
+rld_cor <- cor(rld_mat)    ## cor() is a base R function
+
+### Plot heatmap
+df <- as.data.frame(colData(dds_uni_qc)[,c("sex","wave")])
+pheatmap(rld_cor, annotation_col= df)
+
+
+##Heatmap##
+select_uni <- order(rowMeans(counts(dds_uni_qc,normalized=TRUE)),decreasing=TRUE)[1:50]
+
+df_uni <- as.data.frame(colData(dds_uni)[,c("sex","group")])
+
+rownames(df_uni) <- gsub("[:MIMAT].*", "", rownames(df_uni))
+rownames(ntd_uni) <- gsub("[:MIMAT].*", "", rownames(ntd_uni))
+colnames(ntd_uni) <- gsub("[:Total].*","", colnames(ntd_uni))
+
+pheatmap(assay(ntd_uni)[select_uni,], cluster_rows=TRUE, show_rownames=TRUE,
+         cluster_cols=FALSE, annotation_col=df_uni, fontsize_row=8, fontsize_col
+         =8, main="Heatmap - top 50 expressed miRNA")
+
+```
+## DESeq2 differential gene expression analysis workflow
+#Step 1: Estimate size factors
+
+We can check size factors distribution
+
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+sf <- sizeFactors(dds_uni_A)
+ggplot() + aes(sf) + geom_histogram()
+```
+
+We can generate total normalized and non-normalized counts per sample and compare to size factors
+
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+## Total number of non-normalized counts per sample
+counts_per_sample <- colSums(counts(dds_uni_A))
+
+## Total number of normalized counts per sample
+norm_counts_per_sample <- colSums(counts(dds_uni_A, normalized=T))
+
+ggplot(df) +
+geom_point(aes(x=counts_per_sample, y=norm_counts_per_sample)) +
+geom_line(aes(x=counts_per_sample, y=counts_per_sample, color="red"))
+
+```
+
+We can retrieve the normalized counts matrix from dds, we use the counts() function and add the argument normalized=TRUE.
+
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+normalized_counts <- counts(dds_uni_B, normalized=TRUE)
+write.table(normalized_counts, file="normalized_counts_A.txt", sep="\t", quote=F, col.names=NA)
+
+```
+
+Let's take a look at the dispersion estimates 
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+plotDispEsts(dds_uni_D)
+
+```
+You expect your data to generally scatter around the curve, with the dispersion decreasing with increasing mean expression levels. If you see a cloud or different shapes, then you might want to explore your data more to see if you have contamination (mitochondrial, etc.) or outlier samples.
+
+#Size factor QC
+
+A main assumption in library size factor calculation of edgeR and DESeq2 (and others) is that the majority of genes remain unchanged. Plotting the distribution of gene ratios between each gene and the average gene can show how true this is. Not super useful for many samples because the plot becomes crowed.
+
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+library(DEGreport)
+degCheckFactors(normalized_counts)
+```
+
+3. Look at results
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+
+r
+res <- results(dds_uni_A)
+plot(metadata(res)$filterNumRej, type="b", ylab="number of rejections", xlab="quantiles of filter", lines(metadata(res)$lo.fi, col="red"), abline(v=metadata(res)$filterTheta))
+summary(res)
+resOrdered <- res[order(res$pvalue),]
+resOrdered 
+write.csv(x = resOrdered, file = "resOrdered.csv")
+```
+
+##Mean-Variance QC plots
+p-value distribution gives an idea on how well you model is capturing the input data and as well whether it could be some problem for some set of genes. In general, you expect to have a flat distribution with peaks at 0 and 1. In this case, we add the mean count information to check if any set of genes are enriched in any specific p-value range.
+
+Variation (dispersion) and average expression relationship shouldn’t be a factor among the differentially expressed genes. When plotting average mean and standard deviation, significant genes should be randomly distributed.
+
+In this case, it would be good to look at the ones that are totally outside the expected correlation.
+
+You can put this tree plots together using degQC.
+
+```{r include = TRUE, message=FALSE, warning=FALSE}
+design <- as.data.frame(colData(dds_uni_A))
+degQC(normalized_counts, design[["group"]], pvalue = res[["pvalue"]])
+
+```
+## Covariates effect on count data
+
+Another important analysis to do if you have covariates is to calculate the correlation between PCs from PCA analysis to different variables you may think are affecting the gene expression. This is a toy example of how the function works with raw data, where clearly library size correlates with some of the PCs.
+
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+resCov <- degCovariates(log2(counts(dds_uni)+0.5),
+                        colData(dds_uni))
+```
+##Covariates correlation with metrics
+Also, the correlation among covariates and metrics from the analysis can be tested. This is useful when the study has multiple variables, like in clinical trials. The following code will return a correlation table, and plot the correlation heatmap for all the covariates and metrics in a table.
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+cor <- degCorCov(colData(dds_uni))
+names(cor)
+```
+##QC report
+
+A quick HTML report can be created with createReport to show whether a DE analysis is biased to a particular set of genes. It contains the output of degQC,degVB and degMB.
+
+```{r include = TRUE, message=FALSE, warning=FALSE} 
+createReport(colData(dds_uni)[["group"]], counts(dds_uni, normalized = TRUE),
+             row.names(res)[1:6], res[["pvalue"]], path = ".")
+```
+
